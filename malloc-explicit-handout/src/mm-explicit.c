@@ -5,28 +5,57 @@
  */
 
 #include <stdint.h>
-
 #include "mm.h"
 #include "memlib.h"
+#include <string.h>
 
 /** The required alignment of heap payloads */
 const size_t ALIGNMENT = 2 * sizeof(size_t);
 
 /** The layout of each block allocated on the heap */
-typedef struct {
-    /** The size of the block and whether it is allocated (stored in the low bit) */
-    size_t header;
-    /**
-     * We don't know what the size of the payload will be, so we will
-     * declare it as a zero-length array.  This allow us to obtain a
-     * pointer to the start of the payload.
-     */
-    uint8_t payload[];
-} block_t;
-
+typedef struct block_t block_t;
+    struct block_t {
+        size_t header;
+        union {
+            struct {
+                block_t *next;
+                block_t *prev;
+            };
+        int8_t payload[0];
+        };        
+    };
 /** The first and last blocks on the heap */
 static block_t *mm_heap_first = NULL;
 static block_t *mm_heap_last = NULL;
+static block_t *free_list_head = NULL;
+
+void list_add(block_t *block) {
+    if(free_list_head) {
+        free_list_head->prev = block;
+    }
+    block->next = free_list_head;
+    free_list_head = block;
+    block->prev = NULL;
+}
+
+void list_remove(block_t *block) {
+    if (block == NULL) {
+        return;
+    }
+
+    if (block->prev != NULL) {
+        block->prev->next = block->next;
+    } else {
+        free_list_head = block->next;
+    }
+
+    if (block->next != NULL) {
+        block->next->prev = block->prev;
+    }
+
+    block->next = NULL;
+    block->prev = NULL;
+}
 
 /** Rounds up `size` to the nearest multiple of `n` */
 static size_t round_up(size_t size, size_t n) {
@@ -54,15 +83,13 @@ static bool is_allocated(block_t *block) {
  */
 static block_t *find_fit(size_t size) {
     // Traverse the blocks in the heap using the implicit list
-    for (
-        block_t *curr = mm_heap_first;
-        mm_heap_last != NULL && curr <= mm_heap_last;
-        curr = (void *) curr + get_size(curr)
-    ) {
+    block_t *traverse = free_list_head;
+    while(traverse != NULL) {
         // If the block is free and large enough for the allocation, return it
-        if (!is_allocated(curr) && get_size(curr) >= size) {
-            return curr;
+        if (!is_allocated(traverse) && get_size(traverse) >= size) {
+            return traverse;
         }
+        traverse = traverse->next;
     }
     return NULL;
 }
@@ -78,7 +105,7 @@ static block_t *block_from_payload(void *ptr) {
  */
 bool mm_init(void) {
     // We want the first payload to start at ALIGNMENT bytes from the start of the heap
-    void *padding = mem_sbrk(ALIGNMENT - sizeof(block_t));
+    void *padding = mem_sbrk(ALIGNMENT - sizeof(size_t));
     if (padding == (void *) -1) {
         return false;
     }
@@ -86,9 +113,9 @@ bool mm_init(void) {
     // Initialize the heap with no blocks
     mm_heap_first = NULL;
     mm_heap_last = NULL;
+    free_list_head = NULL;
     return true;
 }
-
 /**
  * mm_malloc - Allocates a block with the given size
  */
@@ -99,8 +126,18 @@ void *mm_malloc(size_t size) {
     // If there is a large enough free block, use it
     block_t *block = find_fit(size);
     if (block != NULL) {
-        set_header(block, get_size(block), true);
-        return block->payload;
+        //if the block is overly large...
+        if (get_size(block) > size) {
+            //split off the end of the block
+            block_t *remainder = (block_t *)((char *)block + size);            
+            size_t remainderSize = get_size(block) - size;
+            set_header(remainder, remainderSize, false);
+            //list_add(remainder);
+        }
+        //use the block
+        list_remove(block);
+        set_header(block, size, true);
+        return block->payload;        
     }
 
     // Otherwise, a new block needs to be allocated at the end of the heap
@@ -131,6 +168,7 @@ void mm_free(void *ptr) {
 
     // Mark the block as unallocated
     block_t *block = block_from_payload(ptr);
+    list_add(block);
     set_header(block, get_size(block), false);
 }
 
@@ -139,18 +177,38 @@ void mm_free(void *ptr) {
  *      copying its data, and mm_freeing the old block.
  */
 void *mm_realloc(void *old_ptr, size_t size) {
-    (void) old_ptr;
-    (void) size;
-    return NULL;
+    if (old_ptr == NULL) {
+        return mm_malloc(size);
+    }
+    if (size == 0) {
+        mm_free(old_ptr);
+        return NULL;
+    }   
+
+    void* new_ptr = mm_malloc(size);
+    //set_header(block_from_payload(new_ptr), size, true);
+    if (get_size(old_ptr) < size) {
+        size = get_size(old_ptr);
+    }
+    memcpy(new_ptr, old_ptr, size);
+    mm_free(old_ptr);
+    return new_ptr;
 }
 
 /**
  * mm_calloc - Allocate the block and set it to zero.
  */
 void *mm_calloc(size_t nmemb, size_t size) {
-    (void) nmemb;
-    (void) size;
-    return NULL;
+    if (nmemb == 0 || size == 0) {
+        return NULL;
+    }
+    if (nmemb > (SIZE_MAX / size)) {
+        return NULL;
+    }
+    size_t total = nmemb * size;
+    void* new_ptr = mm_malloc(total);
+    memset(new_ptr, 0, total);
+    return new_ptr;
 }
 
 /**
